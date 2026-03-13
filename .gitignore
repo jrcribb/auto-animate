@@ -20,4 +20,5 @@ temp
 .idea
 .nuxt
 *.local.json
+.pnpm-store/
 .node_modules_tmp

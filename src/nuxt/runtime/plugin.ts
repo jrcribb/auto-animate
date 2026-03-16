@@ -1,7 +1,15 @@
-import { defineNuxtPlugin } from "#imports"
-import { vAutoAnimate } from "@formkit/auto-animate/vue"
+import { vAutoAnimate } from "../../vue/index"
 
-export default defineNuxtPlugin((app) => {
+type NuxtAppLike = {
+  vueApp: {
+    directive: (
+      name: string,
+      directive: typeof vAutoAnimate
+    ) => void
+  }
+}
+
+export default function autoAnimateNuxtPlugin(app: NuxtAppLike) {
   // Register the directive
   app.vueApp.directive("auto-animate", vAutoAnimate)
-})
+}

@@ -1,8 +1,6 @@
 import { existsSync, promises as fsp } from "fs"
-import { pathToFileURL } from "url"
 import { resolve } from "pathe"
-import { consola } from "consola"
-import type { ModuleMeta, NuxtModule, NuxtConfig } from "@nuxt/schema"
+import type { ModuleMeta } from "@nuxt/schema"
 import { findExports } from "mlly"
 
 interface BuildModuleOptions {
@@ -13,41 +11,6 @@ interface BuildModuleOptions {
   outDir?: string
 }
 
-interface PrepareModuleOptions {
-  rootDir: string
-  srcDir: string
-}
-
-/**
- * Original source: https://github.com/nuxt/module-builder/blob/main/src/prepare.ts
- * @param options
- */
-async function prepareModule (options: PrepareModuleOptions) {
-  const { runCommand } = await import('nuxi')
-
-  return runCommand('prepare', [resolve(options.rootDir, 'build/nuxt-playground')], {
-    overrides: {
-      typescript: {
-        builder: 'shared'
-      },
-      imports: {
-        autoImport: false
-      },
-      modules: [
-        resolve(options.rootDir, `${options.srcDir}/module`),
-        function (_options, nuxt) {
-          nuxt.hooks.hook('app:templates', (app) => {
-            for (const template of app.templates) {
-              template.write = true
-            }
-          })
-        }
-      ]
-    } satisfies NuxtConfig
-  })
-}
-
-
 /**
  * Original source: https://github.com/nuxt/module-builder/blob/main/src/build.ts
  * @param opts - options
@@ -57,8 +20,6 @@ export async function buildModule(opts: BuildModuleOptions) {
 
   const outDir = opts.outDir || "dist"
   const srcDir = opts.srcDir || "src"
-
-  await prepareModule({ rootDir: opts.rootDir, srcDir })
 
   await build(opts.rootDir, false, {
     clean: false, // auto-animate’s build does its own cleaning
@@ -74,9 +35,6 @@ export async function buildModule(opts: BuildModuleOptions) {
     rollup: {
       emitCJS: false,
       cjsBridge: false,
-      dts: {
-        tsconfig: "./build/nuxt-playground/tsconfig.json",
-      },
     },
     externals: [
       "@nuxt/schema",
@@ -95,25 +53,11 @@ export async function buildModule(opts: BuildModuleOptions) {
         // Generate CommonJS stub
         await writeCJSStub(outDir)
 
-        // Load module meta
-        const moduleEntryPath = resolve(outDir, "module.mjs")
-        const moduleFn: NuxtModule<any> = await import(
-          pathToFileURL(moduleEntryPath).toString()
+        // This build runs through jiti, which cannot evaluate @nuxt/kit's import.meta usage.
+        const moduleMeta = await readModuleMeta(
+          resolve(opts.rootDir, `${srcDir}/module.ts`),
+          ctx.pkg
         )
-          .then((r) => r.default || r)
-          .catch((err) => {
-            consola.error(err)
-            consola.error(
-              "Cannot load module. Please check dist:",
-              moduleEntryPath
-            )
-            return null
-          })
-
-        if (!moduleFn || !moduleFn.getMeta) {
-          return
-        }
-        const moduleMeta = await moduleFn.getMeta()
 
         // Enhance meta using package.json
         if (ctx.pkg) {
@@ -140,7 +84,34 @@ export async function buildModule(opts: BuildModuleOptions) {
   })
 }
 
-async function writeTypes(distDir: string, meta: ModuleMeta) {
+async function readModuleMeta(
+  moduleFile: string,
+  pkg?: { name?: string; version?: string }
+): Promise<Partial<ModuleMeta>> {
+  const source = await fsp.readFile(moduleFile, "utf8").catch(() => "")
+  const moduleMeta: Partial<ModuleMeta> = {}
+
+  const nameMatch = source.match(/name:\s*["'`]([^"'`]+)["'`]/)
+  if (nameMatch) {
+    moduleMeta.name = nameMatch[1]
+  }
+
+  const configKeyMatch = source.match(/configKey:\s*["'`]([^"'`]+)["'`]/)
+  if (configKeyMatch) {
+    moduleMeta.configKey = configKeyMatch[1]
+  }
+
+  if (pkg?.name && !moduleMeta.name) {
+    moduleMeta.name = pkg.name
+  }
+  if (pkg?.version) {
+    moduleMeta.version = pkg.version
+  }
+
+  return moduleMeta
+}
+
+async function writeTypes(distDir: string, meta: Partial<ModuleMeta>) {
   const dtsFile = resolve(distDir, "types.d.ts")
   const dtsFileMts = resolve(distDir, "types.d.mts")
   if (existsSync(dtsFile)) {
@@ -155,19 +126,33 @@ async function writeTypes(distDir: string, meta: ModuleMeta) {
   const typeExports = findExports(
     // Replace `export { type Foo }` with `export { Foo }`
     moduleTypes.replace(/export\s*{.*?}/gs, (match) =>
-      match.replace(/\btype\b/g, "")
+      match.replace(/\b(type|interface)\b/g, "")
     )
   )
   const isStub = moduleTypes.includes("export *")
 
   const schemaShims = []
   const moduleImports = []
+  const schemaImports = []
+  const moduleExports = []
+  const namedExports = typeExports.flatMap((exp) =>
+    exp.names.filter((name) => name !== "default")
+  )
 
   const hasTypeExport = (name: string) =>
     isStub || typeExports.find((exp) => exp.names.includes(name))
 
-  if (meta.configKey && hasTypeExport("ModuleOptions")) {
+  if (meta.configKey && !hasTypeExport("ModuleOptions")) {
+    schemaImports.push("NuxtModule")
+    moduleImports.push("default as Module")
+    moduleExports.push(
+      "export type ModuleOptions = typeof Module extends NuxtModule<infer O> ? Partial<O> : Record<string, any>"
+    )
+  } else if (hasTypeExport("ModuleOptions")) {
     moduleImports.push("ModuleOptions")
+  }
+
+  if (meta.configKey) {
     schemaShims.push(
       `  interface NuxtConfig { ['${meta.configKey}']?: Partial<ModuleOptions> }`
     )
@@ -191,7 +176,8 @@ async function writeTypes(distDir: string, meta: ModuleMeta) {
   }
 
   const dtsContents = `
-import { ${moduleImports.join(", ")} } from './module'
+${schemaImports.length ? `import type { ${schemaImports.join(", ")} } from '@nuxt/schema'` : ""}
+${moduleImports.length ? `import type { ${moduleImports.join(", ")} } from './module'` : ""}
 
 ${
   schemaShims.length
@@ -203,13 +189,17 @@ ${
     ? `declare module 'nuxt/schema' {\n${schemaShims.join("\n")}\n}\n`
     : ""
 }
-
-export { ${typeExports[0].names.join(", ")} } from './module'
+${moduleExports.join("\n")}
+${namedExports.length ? `export { ${namedExports.map((name) => `type ${name}`).join(", ")} } from './module'` : ""}
 `
 
   await fsp.writeFile(dtsFile, dtsContents, "utf8")
   if (!existsSync(dtsFileMts)) {
-    await fsp.writeFile(dtsFileMts, dtsContents, "utf8")
+    await fsp.writeFile(
+      dtsFileMts,
+      dtsContents.replace(/'\.\/module'/g, "'./module.mjs'"),
+      "utf8"
+    )
   }
 }
 
